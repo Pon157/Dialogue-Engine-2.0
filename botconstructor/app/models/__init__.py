@@ -9,6 +9,7 @@ from app.models.core import (
     Broadcast,
     ForwardMode,
     MessageLog,
+    TicketMessage,
     Warn,
 )
 from app.models.extra import (
@@ -31,6 +32,7 @@ __all__ = [
     "Warn",
     "BanLog",
     "MessageLog",
+    "TicketMessage",
     "Broadcast",
     "ButtonKind",
     "ButtonStyle",
