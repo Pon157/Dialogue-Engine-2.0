@@ -177,8 +177,25 @@ async def any_user_message(message: Message, bot_row: Bot):
     if bot_row.bot_type.value != "support" or not bot_row.target_chat_id:
         return
 
+    thread_id = None
+    if bot_row.use_topics:
+        async with async_session() as session:
+            result = await session.execute(select(BotUser).where(BotUser.bot_id == bot_row.id, BotUser.tg_id == message.from_user.id))
+            u = result.scalar_one()
+            if u.active_topic_id is None:
+                try:
+                    topic = await message.bot.create_forum_topic(
+                        bot_row.target_chat_id,
+                        name=f"{message.from_user.full_name} (ID {message.from_user.id})",
+                    )
+                    u.active_topic_id = topic.message_thread_id
+                    await session.commit()
+                except Exception:
+                    pass  # чат не форум/нет прав — просто шлём без топика
+            thread_id = u.active_topic_id
+
     if bot_row.forward_mode.value == "forward":
-        await message.forward(bot_row.target_chat_id)
+        sent = await message.forward(bot_row.target_chat_id, message_thread_id=thread_id)
     else:
         header_parts = []
         if bot_row.copy_show_name:
@@ -188,4 +205,8 @@ async def any_user_message(message: Message, bot_row: Bot):
         if bot_row.copy_show_id:
             header_parts.append(f"ID: {message.from_user.id}")
         header = " | ".join(header_parts)
-        await message.copy_to(bot_row.target_chat_id, caption=header if header else None)
+        sent = await message.copy_to(bot_row.target_chat_id, caption=header if header else None, message_thread_id=thread_id)
+
+    async with async_session() as session:
+        session.add(TicketMessage(bot_id=bot_row.id, group_message_id=sent.message_id, user_tg_id=message.from_user.id))
+        await session.commit()
