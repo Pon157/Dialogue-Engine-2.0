@@ -12,7 +12,7 @@ async def main():
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)  # не спамить в лог служебными апдейтами
 
     try:
-        await manager.sync_loop()  # крутится вечно, сам ловит новых/удалённых ботов из БД
+        await asyncio.gather(manager.sync_loop(), manager.load_monitor_loop())
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:

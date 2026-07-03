@@ -12,6 +12,13 @@ class ButtonKind(str, enum.Enum):
     TRIGGER = "trigger"   # при нажатии срабатывает триггер (см. Trigger.key)
 
 
+class ButtonStyle(str, enum.Enum):
+    NONE = "none"
+    PRIMARY = "primary"
+    SUCCESS = "success"
+    DANGER = "danger"
+
+
 class InlineButton(Base):
     __tablename__ = "inline_buttons"
 
@@ -24,6 +31,9 @@ class InlineButton(Base):
     trigger_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     row: Mapped[int] = mapped_column(Integer, default=0)
     col: Mapped[int] = mapped_column(Integer, default=0)
+    # Bot API 9.4+: цвет кнопки и иконка кастомным эмодзи
+    style: Mapped[ButtonStyle] = mapped_column(Enum(ButtonStyle), default=ButtonStyle.NONE)
+    icon_custom_emoji_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 class KeyboardButton(Base):
@@ -36,6 +46,8 @@ class KeyboardButton(Base):
     trigger_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     row: Mapped[int] = mapped_column(Integer, default=0)
     col: Mapped[int] = mapped_column(Integer, default=0)
+    style: Mapped[ButtonStyle] = mapped_column(Enum(ButtonStyle), default=ButtonStyle.NONE)
+    icon_custom_emoji_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 class Trigger(Base):

@@ -54,6 +54,23 @@ class Bot(Base):
     donate_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     donate_button_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)  # 'inline' | 'keyboard'
 
+    # --- реклама в приветственном сообщении ---
+    ads_in_welcome_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # --- антиспам ---
+    antispam_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    antispam_max_requests: Mapped[int] = mapped_column(Integer, default=5)   # запросов
+    antispam_window_seconds: Mapped[int] = mapped_column(Integer, default=10)  # за N секунд
+    antispam_mute_seconds: Mapped[int] = mapped_column(Integer, default=30)  # молчим для юзера после превышения
+
+    # --- капча (Pillow) ---
+    captcha_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    captcha_every_n: Mapped[int] = mapped_column(Integer, default=0)  # 0 = только на первом входе
+
+    # --- защита от перегрузки/DDoS на сам бот ---
+    ddos_threshold_msgs_10min: Mapped[int] = mapped_column(Integer, default=600)
+    auto_stopped_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

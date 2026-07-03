@@ -6,11 +6,14 @@ from aiogram import Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.config import settings
 from app.db import async_session
 from app.engine.handlers.base import router as base_router
+from app.engine.handlers.moderation import router as moderation_router
+from app.engine.handlers.posting import router as posting_router
+from app.engine.middlewares.antispam import AntiSpamMiddleware, load_last_10min
 from app.models import Bot as BotRow
 
 logger = logging.getLogger("multibot")
@@ -27,26 +30,39 @@ class RunningBot:
 
 class MultiBotManager:
     """Держит в памяти словарь {bot_id: RunningBot} и синхронизирует его с таблицей `bots`
-    в Postgres каждые BOT_POLL_INTERVAL секунд: новые/включённые боты — запускаются,
-    отключённые/удалённые — останавливаются, у кого сменился токен — перезапускаются.
-    Так добавление бота через админку конструктора (INSERT в таблицу bots) без перезапуска
-    всего сервиса поднимает нового живого Telegram-бота.
-    """
+    в Postgres каждые BOT_POLL_INTERVAL секунд, а также следит за нагрузкой на каждого
+    бота (см. load_monitor_loop) — если бота начинают DDoS'ить, движок сам его
+    останавливает и шлёт уведомление владельцу через master-бота."""
 
     def __init__(self):
         self._running: dict[int, RunningBot] = {}
         self._stopping = False
+        self._master_bot: AiogramBot | None = None
+
+    def _get_master_bot(self) -> AiogramBot:
+        if self._master_bot is None:
+            self._master_bot = AiogramBot(
+                token=settings.MASTER_BOT_TOKEN,
+                default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+            )
+        return self._master_bot
 
     async def start_bot(self, bot_row: BotRow) -> None:
         aiogram_bot = AiogramBot(
             token=bot_row.token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
+        me = await aiogram_bot.get_me()
+
         dp = Dispatcher(storage=MemoryStorage())
+        dp.message.outer_middleware(AntiSpamMiddleware())
+        dp.callback_query.outer_middleware(AntiSpamMiddleware())
+        dp.include_router(moderation_router)
+        dp.include_router(posting_router)
         dp.include_router(base_router)
 
-        # прокидываем строку конфигурации бота во все хэндлеры через workflow_data
         dp["bot_row"] = bot_row
+        dp["bot_username"] = me.username
 
         async def _poll():
             try:
@@ -59,7 +75,7 @@ class MultiBotManager:
 
         task = asyncio.create_task(_poll(), name=f"bot-{bot_row.id}")
         self._running[bot_row.id] = RunningBot(bot_row, aiogram_bot, dp, task)
-        logger.info("Запущен бот id=%s (@%s)", bot_row.id, bot_row.username)
+        logger.info("Запущен бот id=%s (@%s)", bot_row.id, me.username)
 
     async def stop_bot(self, bot_id: int) -> None:
         running = self._running.pop(bot_id, None)
@@ -82,12 +98,10 @@ class MultiBotManager:
             result = await session.execute(select(BotRow).where(BotRow.is_active.is_(True)))
             active_bots = {b.id: b for b in result.scalars().all()}
 
-        # остановить тех, кого больше нет в активных
         for bot_id in list(self._running.keys()):
             if bot_id not in active_bots:
                 await self.stop_bot(bot_id)
 
-        # запустить новых / перезапустить с изменённым токеном
         for bot_id, bot_row in active_bots.items():
             running = self._running.get(bot_id)
             if running is None:
@@ -95,7 +109,6 @@ class MultiBotManager:
             elif running.token != bot_row.token:
                 await self.reload_bot(bot_row)
             else:
-                # настройки (welcome_text и т.п.) могли поменяться — обновляем workflow_data
                 running.dp["bot_row"] = bot_row
                 running.bot_row = bot_row
 
@@ -107,10 +120,51 @@ class MultiBotManager:
                 logger.exception("Ошибка синхронизации списка ботов с БД")
             await asyncio.sleep(settings.BOT_POLL_INTERVAL)
 
+    async def _auto_stop_bot(self, bot_row: BotRow, msgs_in_10min: int) -> None:
+        reason = (
+            f"Автоматически остановлен: за 10 минут поймано {msgs_in_10min} сообщений "
+            f"(порог {bot_row.ddos_threshold_msgs_10min}). Похоже на спам/DDoS."
+        )
+        async with async_session() as session:
+            await session.execute(
+                update(BotRow)
+                .where(BotRow.id == bot_row.id)
+                .values(is_active=False, auto_stopped_reason=reason)
+            )
+            await session.commit()
+
+        await self.stop_bot(bot_row.id)
+
+        try:
+            master = self._get_master_bot()
+            await master.send_message(
+                bot_row.owner_tg_id,
+                (
+                    f"⛔ Бот <b>@{bot_row.username or bot_row.id}</b> автоматически остановлен.\n\n"
+                    f"{reason}\n\n"
+                    "Вы можете снова включить его в панели управления после проверки — "
+                    "рекомендуем включить/ужесточить антиспам и капчу перед повторным запуском."
+                ),
+            )
+        except Exception:
+            logger.exception("Не удалось уведомить владельца bot_id=%s об автоостановке", bot_row.id)
+
+    async def load_monitor_loop(self) -> None:
+        """Раз в минуту проверяет нагрузку за последние 10 минут по каждому запущенному боту."""
+        while not self._stopping:
+            await asyncio.sleep(60)
+            for bot_id, running in list(self._running.items()):
+                count = load_last_10min(bot_id)
+                if count > running.bot_row.ddos_threshold_msgs_10min:
+                    logger.warning("Bot id=%s превысил порог нагрузки: %s сообщений/10мин", bot_id, count)
+                    await self._auto_stop_bot(running.bot_row, count)
+
     async def shutdown(self) -> None:
         self._stopping = True
         for bot_id in list(self._running.keys()):
             await self.stop_bot(bot_id)
+        if self._master_bot is not None:
+            await self._master_bot.session.close()
 
 
 manager = MultiBotManager()

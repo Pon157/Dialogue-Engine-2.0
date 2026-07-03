@@ -1,4 +1,5 @@
 from app.db import Base
+from app.models.ads import AD_MAX_TEXT_LEN, AD_PAYMENT_CONTACT, AD_TARIFFS, AdOrder, AdStatus
 from app.models.core import (
     BanLog,
     Bot,
@@ -12,6 +13,7 @@ from app.models.core import (
 )
 from app.models.extra import (
     ButtonKind,
+    ButtonStyle,
     InlineButton,
     KeyboardButton,
     PostingSettings,
@@ -31,9 +33,15 @@ __all__ = [
     "MessageLog",
     "Broadcast",
     "ButtonKind",
+    "ButtonStyle",
     "InlineButton",
     "KeyboardButton",
     "Trigger",
     "PostingSettings",
     "PostReview",
+    "AdOrder",
+    "AdStatus",
+    "AD_TARIFFS",
+    "AD_PAYMENT_CONTACT",
+    "AD_MAX_TEXT_LEN",
 ]
