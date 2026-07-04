@@ -1,3 +1,5 @@
+import uuid
+
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -6,7 +8,7 @@ from sqlalchemy import select, update
 from app.db import async_session
 from app.emoji import btn_emoji, tg
 from app.master.states import AddButton, EditAntispam, EditWelcome
-from app.models import Bot, ButtonKind, ButtonStyle, ForwardMode, InlineButton
+from app.models import Bot, ButtonKind, ButtonStyle, ForwardMode, InlineButton, Trigger
 
 router = Router(name="master_bot")
 
@@ -34,6 +36,8 @@ def bot_menu_kb(b: Bot) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=f"{btn_emoji('chart','📊')} Статистика", callback_data=f"bot:{b.id}:stats")],
             [InlineKeyboardButton(text=f"{btn_emoji('link','🔗')} Пересылка/копирование", callback_data=f"bot:{b.id}:forward")],
             [InlineKeyboardButton(text=f"{btn_emoji('dollar','💵')} Донат", callback_data=f"bot:{b.id}:donate")],
+            [InlineKeyboardButton(text="🔄 Сменить тип бота", callback_data=f"bot:{b.id}:changetype")],
+            [InlineKeyboardButton(text="🗑 Удалить бота", callback_data=f"bot:{b.id}:delete")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="mybots")],
         ]
     )
@@ -71,7 +75,82 @@ def forward_kb(b: Bot) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-@router.callback_query(F.data.regexp(r"^bot:(\d+):forward$"))
+@router.callback_query(F.data.regexp(r"^bot:(\d+):changetype$"))
+async def changetype_menu(call: CallbackQuery):
+    bot_id = int(call.data.split(":")[1])
+    b = await _get_bot(bot_id, call.from_user.id)
+    if not b:
+        return
+    await call.message.edit_text(
+        f"Текущий тип: {b.bot_type.value}. Выберите новый тип бота:\n\n"
+        "⚠️ При смене типа настройки, специфичные для старого типа "
+        "(например, приём постов), перестанут применяться, но не удаляются из БД.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="💬 Общение / поддержка", callback_data=f"bot:{bot_id}:settype:support")],
+                [InlineKeyboardButton(text="📣 Постинг в канал", callback_data=f"bot:{bot_id}:settype:posting")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"bot:{bot_id}")],
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data.regexp(r"^bot:(\d+):settype:(support|posting)$"))
+async def settype(call: CallbackQuery):
+    bot_id = int(call.data.split(":")[1])
+    new_type = call.data.split(":")[3]
+    b = await _get_bot(bot_id, call.from_user.id)
+    if not b:
+        return
+    async with async_session() as session:
+        await session.execute(update(Bot).where(Bot.id == bot_id).values(bot_type=new_type))
+        await session.commit()
+    await call.answer("Тип бота изменён ✅")
+    b.bot_type = new_type
+    await call.message.edit_text(f"Бот @{b.username} — тип изменён на «{new_type}».", reply_markup=bot_menu_kb(b))
+
+
+@router.callback_query(F.data.regexp(r"^bot:(\d+):delete$"))
+async def delete_bot_confirm(call: CallbackQuery, state: FSMContext):
+    bot_id = int(call.data.split(":")[1])
+    b = await _get_bot(bot_id, call.from_user.id)
+    if not b:
+        return
+    await state.update_data(delete_bot_id=bot_id)
+    await call.message.edit_text(
+        f"⚠️ Вы точно хотите удалить бота @{b.username}? Это действие необратимо — "
+        "будут удалены все его настройки, пользователи, статистика.\n\n"
+        "Чтобы подтвердить, напишите в чат: <b>Да, хочу удалить бот</b>",
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+
+@router.message(F.text == "Да, хочу удалить бот")
+async def delete_bot_execute(message: Message, state: FSMContext):
+    data = await state.get_data()
+    bot_id = data.get("delete_bot_id")
+    if not bot_id:
+        await message.answer("Не вижу, какого бота вы хотите удалить — откройте его меню и нажмите «Удалить бота» снова.")
+        return
+
+    async with async_session() as session:
+        b = await _get_bot(bot_id, message.from_user.id)
+        if not b:
+            await message.answer("Бот не найден (возможно, уже удалён).")
+            await state.clear()
+            return
+        result = await session.execute(select(Bot).where(Bot.id == bot_id))
+        row = result.scalar_one()
+        username = row.username
+        await session.delete(row)
+        await session.commit()
+
+    await state.clear()
+    await message.answer(f"Бот @{username} удалён.")
+
+
+
 async def forward_menu(call: CallbackQuery):
     bot_id = int(call.data.split(":")[1])
     b = await _get_bot(bot_id, call.from_user.id)
@@ -411,6 +490,47 @@ async def captcha_setn_save(message: Message, state: FSMContext):
 # ---------- конструктор inline-кнопок с premium emoji + style ----------
 
 @router.callback_query(F.data.regexp(r"^bot:(\d+):addbtn$"))
+async def addbtn_list(call: CallbackQuery):
+    bot_id = int(call.data.split(":")[1])
+    b = await _get_bot(bot_id, call.from_user.id)
+    if not b:
+        return
+    async with async_session() as session:
+        result = await session.execute(select(InlineButton).where(InlineButton.bot_id == bot_id))
+        buttons = result.scalars().all()
+
+    rows = []
+    for btn in buttons:
+        label = f"{btn.text} ({btn.kind.value}, {btn.style.value})"
+        rows.append([InlineKeyboardButton(text=f"🗑 {label}", callback_data=f"delbtn:{btn.id}:{bot_id}")])
+    rows.append([InlineKeyboardButton(text=f"{btn_emoji('plus','➕')} Добавить новую", callback_data=f"bot:{bot_id}:addbtn:new")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"bot:{bot_id}")])
+
+    text = "Кнопки на приветственном сообщении:" if buttons else "Пока нет ни одной кнопки."
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.regexp(r"^delbtn:(\d+):(\d+)$"))
+async def delete_button(call: CallbackQuery):
+    _, btn_id_str, bot_id_str = call.data.split(":")
+    btn_id, bot_id = int(btn_id_str), int(bot_id_str)
+    async with async_session() as session:
+        result = await session.execute(select(InlineButton).where(InlineButton.id == btn_id, InlineButton.bot_id == bot_id))
+        btn = result.scalar_one_or_none()
+        if btn:
+            if btn.trigger_key:
+                trg_result = await session.execute(select(Trigger).where(Trigger.bot_id == bot_id, Trigger.key == btn.trigger_key))
+                trg = trg_result.scalar_one_or_none()
+                if trg:
+                    await session.delete(trg)
+            await session.delete(btn)
+            await session.commit()
+    await call.answer("Кнопка удалена")
+    call.data = f"bot:{bot_id}:addbtn"
+    await addbtn_list(call)
+
+
+@router.callback_query(F.data.regexp(r"^bot:(\d+):addbtn:new$"))
 async def addbtn_start(call: CallbackQuery, state: FSMContext):
     bot_id = int(call.data.split(":")[1])
     await state.update_data(bot_id=bot_id)
@@ -434,7 +554,7 @@ async def addbtn_content(message: Message, state: FSMContext):
     await state.update_data(text=message.text or "", icon_custom_emoji_id=icon_id)
     await state.set_state(AddButton.waiting_url)
     await message.answer(
-        "Это кнопка-ссылка или кнопка-триггер?",
+        "Это кнопка-ссылка или кнопка-триггер (при нажатии бот пришлёт сообщение)?",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="🔗 Ссылка", callback_data="addbtn:url")],
@@ -449,10 +569,14 @@ async def addbtn_kind(call: CallbackQuery, state: FSMContext):
     kind = "url" if call.data == "addbtn:url" else "trigger"
     await state.update_data(kind=kind)
     if kind == "url":
+        await state.set_state(AddButton.waiting_url)
         await call.message.edit_text("Пришлите ссылку (https://...):")
-        return  # ждём текстовое сообщение — см. addbtn_url_value ниже
-    await state.set_state(AddButton.waiting_style)
-    await call.message.edit_text("Выберите цвет кнопки (Bot API 9.4):", reply_markup=_style_kb())
+        return
+    await state.set_state(AddButton.waiting_trigger_text)
+    await call.message.edit_text(
+        "Пришлите текст, который бот отправит при нажатии на эту кнопку "
+        "(поддерживается HTML-форматирование, можно с фото)."
+    )
 
 
 def _style_kb() -> InlineKeyboardMarkup:
@@ -484,23 +608,43 @@ async def addbtn_url_value(message: Message, state: FSMContext):
     await message.answer("Выберите цвет кнопки (Bot API 9.4):", reply_markup=_style_kb())
 
 
+@router.message(AddButton.waiting_trigger_text)
+async def addbtn_trigger_text(message: Message, state: FSMContext):
+    text = message.html_text if message.text else (message.caption or "")
+    photo_id = message.photo[-1].file_id if message.photo else None
+    await state.update_data(trigger_text=text, trigger_photo=photo_id)
+    await state.set_state(AddButton.waiting_style)
+    await message.answer("Выберите цвет кнопки (Bot API 9.4):", reply_markup=_style_kb())
+
+
 @router.callback_query(AddButton.waiting_style, F.data.startswith("style:"))
 async def addbtn_style(call: CallbackQuery, state: FSMContext):
     style = ButtonStyle(call.data.split(":")[1])
     data = await state.get_data()
+    trigger_key = f"btn_{uuid.uuid4().hex[:12]}" if data["kind"] == "trigger" else None
 
     async with async_session() as session:
         btn = InlineButton(
             bot_id=data["bot_id"],
-            context="menu",
+            context="welcome",
             text=data["text"],
             kind=ButtonKind(data["kind"]),
             url=data.get("url"),
-            trigger_key=f"btn_{data['bot_id']}_{data['text'][:16]}" if data["kind"] == "trigger" else None,
+            trigger_key=trigger_key,
             style=style,
             icon_custom_emoji_id=data.get("icon_custom_emoji_id"),
         )
         session.add(btn)
+
+        if data["kind"] == "trigger":
+            session.add(
+                Trigger(
+                    bot_id=data["bot_id"],
+                    key=trigger_key,
+                    response_text=data.get("trigger_text"),
+                    response_photo_file_id=data.get("trigger_photo"),
+                )
+            )
         await session.commit()
 
     await state.clear()

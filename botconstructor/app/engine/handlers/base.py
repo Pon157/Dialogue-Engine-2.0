@@ -9,7 +9,15 @@ from datetime import datetime, timezone
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import CallbackQuery, LabeledPrice, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton as KeyboardButtonTG,
+    LabeledPrice,
+    Message,
+    ReplyKeyboardMarkup,
+)
 from sqlalchemy import select
 
 from app.db import async_session
@@ -92,6 +100,13 @@ async def cmd_start(message: Message, bot_row: Bot):
         welcome_buttons = btn_result.scalars().all()
     markup = build_inline_markup(welcome_buttons)
 
+    if bot_row.donate_enabled and (bot_row.donate_button_kind or "inline") == "inline":
+        donate_button = InlineKeyboardButton(text="💵 Донат", callback_data="donate_prompt")
+        if markup is None:
+            markup = InlineKeyboardMarkup(inline_keyboard=[[donate_button]])
+        else:
+            markup.inline_keyboard.append([donate_button])
+
     if bot_row.welcome_photo_file_id:
         await message.answer_photo(
             bot_row.welcome_photo_file_id,
@@ -101,6 +116,30 @@ async def cmd_start(message: Message, bot_row: Bot):
         )
     elif welcome_text:
         await message.answer(welcome_text, parse_mode="HTML", reply_markup=markup)
+
+    if bot_row.donate_enabled and bot_row.donate_button_kind == "keyboard":
+        await message.answer(
+            "Донат доступен через кнопку ниже 👇",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButtonTG(text="💵 Донат")]], resize_keyboard=True
+            ),
+        )
+
+
+@router.callback_query(F.data == "donate_prompt")
+async def donate_prompt_callback(call: CallbackQuery, bot_row: Bot):
+    if not bot_row.donate_enabled:
+        await call.answer()
+        return
+    await call.answer()
+    await call.message.answer("Введите количество звёзд ⭐, которое хотите задонатить (например: 50):")
+
+
+@router.message(F.text == "💵 Донат")
+async def donate_prompt_keyboard(message: Message, bot_row: Bot):
+    if not bot_row.donate_enabled:
+        return
+    await message.answer("Введите количество звёзд ⭐, которое хотите задонатить (например: 50):")
 
 
 @router.message(Command("donate"))

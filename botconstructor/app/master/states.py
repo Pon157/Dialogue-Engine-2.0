@@ -21,6 +21,7 @@ class EditAntispam(StatesGroup):
 class AddButton(StatesGroup):
     waiting_content = State()   # ждём текст/эмодзи кнопки
     waiting_url = State()       # если кнопка типа url
+    waiting_trigger_text = State()  # если кнопка типа триггер — текст ответа
     waiting_style = State()     # выбор цвета кнопки
 
 

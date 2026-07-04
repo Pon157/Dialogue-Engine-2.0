@@ -22,30 +22,23 @@ from app.models import Bot as BotRow
 logger = logging.getLogger("multibot")
 
 
-class RunningBot:
-    def __init__(self, bot_row: BotRow, aiogram_bot: AiogramBot, task: asyncio.Task):
-        self.bot_row = bot_row
-        self.aiogram_bot = aiogram_bot
-        self.task = task
-        self.token = bot_row.token
-
-
 class MultiBotManager:
-    """ВАЖНО: используется ОДИН общий Dispatcher и ОДИН набор роутеров на все боты сразу —
-    это единственно правильный способ в aiogram, т.к. Router можно прикрепить только
-    к одному Dispatcher (иначе 'Router is already attached'). Какой именно bot_row
-    относится к текущему апдейту, определяет BotContextMiddleware по bot.token.
-
-    Менеджер синхронизирует список запущенных aiogram Bot-инстансов с таблицей `bots`
-    в Postgres каждые BOT_POLL_INTERVAL секунд, следит за нагрузкой на каждого бота
-    (load_monitor_loop) и автоматически останавливает бота при похожей на DDoS нагрузке."""
+    """ВАЖНО: aiogram не поддерживает параллельные независимые dp.start_polling(bot)
+    вызовы на одном Dispatcher — они не изолированы и мешают друг другу (отсюда баг
+    "первый бот работает, второй нет"). Правильный способ — ОДИН вызов
+    dp.start_polling(bot1, bot2, ..., botN) со всеми активными ботами сразу.
+    При любом изменении набора ботов (добавили/удалили/сменили токен) — этот единственный
+    polling-таск полностью перезапускается с новым списком ботов."""
 
     def __init__(self):
-        self._running: dict[int, RunningBot] = {}
+        self._aiogram_bots: dict[int, AiogramBot] = {}   # bot_id -> aiogram Bot
+        self._bot_rows: dict[int, BotRow] = {}            # bot_id -> текущая строка из БД
         self._bot_rows_by_token: dict[str, BotRow] = {}
         self._usernames_by_token: dict[str, str] = {}
+        self._polling_task: asyncio.Task | None = None
         self._stopping = False
         self._master_bot: AiogramBot | None = None
+        self._resync_lock = asyncio.Lock()
 
         self.dp = Dispatcher(storage=MemoryStorage())
         self.dp.message.outer_middleware(AntiSpamMiddleware())
@@ -71,67 +64,96 @@ class MultiBotManager:
             )
         return self._master_bot
 
-    async def start_bot(self, bot_row: BotRow) -> None:
-        aiogram_bot = AiogramBot(
-            token=bot_row.token,
-            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-        )
-        me = await aiogram_bot.get_me()
+    async def _restart_polling(self) -> None:
+        """Останавливает текущий общий polling-таск (если был) и запускает новый
+        со свежим списком self._aiogram_bots. Вызывается при ЛЮБОМ изменении набора ботов."""
+        if self._polling_task is not None:
+            self._polling_task.cancel()
+            try:
+                await self._polling_task
+            except asyncio.CancelledError:
+                pass
+            self._polling_task = None
 
-        self._bot_rows_by_token[bot_row.token] = bot_row
-        self._usernames_by_token[bot_row.token] = me.username
+        if not self._aiogram_bots:
+            return
+
+        bots = list(self._aiogram_bots.values())
+        for b in bots:
+            try:
+                await b.delete_webhook(drop_pending_updates=True)
+            except Exception:
+                logger.exception("Не удалось снять webhook у бота")
 
         async def _poll():
             try:
-                await aiogram_bot.delete_webhook(drop_pending_updates=True)
-                await self.dp.start_polling(aiogram_bot, handle_signals=False)
+                await self.dp.start_polling(*bots, handle_signals=False)
             except asyncio.CancelledError:
                 pass
             except Exception:
-                logger.exception("Bot id=%s упал с ошибкой, будет перезапущен на след. цикле синка", bot_row.id)
+                logger.exception("Общий polling-таск упал с ошибкой")
 
-        task = asyncio.create_task(_poll(), name=f"bot-{bot_row.id}")
-        self._running[bot_row.id] = RunningBot(bot_row, aiogram_bot, task)
-        logger.info("Запущен бот id=%s (@%s)", bot_row.id, me.username)
-
-    async def stop_bot(self, bot_id: int) -> None:
-        running = self._running.pop(bot_id, None)
-        if running is None:
-            return
-        self._bot_rows_by_token.pop(running.token, None)
-        self._usernames_by_token.pop(running.token, None)
-        running.task.cancel()
-        try:
-            await running.task
-        except asyncio.CancelledError:
-            pass
-        await running.aiogram_bot.session.close()
-        logger.info("Остановлен бот id=%s", bot_id)
-
-    async def reload_bot(self, bot_row: BotRow) -> None:
-        await self.stop_bot(bot_row.id)
-        await self.start_bot(bot_row)
+        self._polling_task = asyncio.create_task(_poll(), name="multibot-polling")
+        logger.info("Polling перезапущен, активных ботов: %s", len(bots))
 
     async def sync_once(self) -> None:
-        async with async_session() as session:
-            result = await session.execute(select(BotRow).where(BotRow.is_active.is_(True)))
-            active_bots = {b.id: b for b in result.scalars().all()}
+        async with self._resync_lock:
+            async with async_session() as session:
+                result = await session.execute(select(BotRow).where(BotRow.is_active.is_(True)))
+                active_bots = {b.id: b for b in result.scalars().all()}
 
-        for bot_id in list(self._running.keys()):
-            if bot_id not in active_bots:
-                await self.stop_bot(bot_id)
+            changed = False
 
-        for bot_id, bot_row in active_bots.items():
-            running = self._running.get(bot_id)
-            if running is None:
-                await self.start_bot(bot_row)
-            elif running.token != bot_row.token:
-                await self.reload_bot(bot_row)
-            else:
-                # настройки могли поменяться в БД — обновляем кэш, который читает
-                # BotContextMiddleware на каждый апдейт (без пересоздания бота)
+            # убрать тех, кого больше нет / выключили
+            for bot_id in list(self._aiogram_bots.keys()):
+                if bot_id not in active_bots:
+                    aiogram_bot = self._aiogram_bots.pop(bot_id)
+                    old_row = self._bot_rows.pop(bot_id, None)
+                    if old_row:
+                        self._bot_rows_by_token.pop(old_row.token, None)
+                        self._usernames_by_token.pop(old_row.token, None)
+                    await aiogram_bot.session.close()
+                    changed = True
+                    logger.info("Бот id=%s остановлен", bot_id)
+
+            # добавить новых / пересоздать с изменённым токеном
+            for bot_id, bot_row in active_bots.items():
+                old_row = self._bot_rows.get(bot_id)
+                if old_row is None:
+                    aiogram_bot = AiogramBot(
+                        token=bot_row.token,
+                        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+                    )
+                    try:
+                        me = await aiogram_bot.get_me()
+                    except Exception:
+                        logger.exception("Не удалось подключиться к боту id=%s, пропускаем", bot_id)
+                        await aiogram_bot.session.close()
+                        continue
+                    self._aiogram_bots[bot_id] = aiogram_bot
+                    self._usernames_by_token[bot_row.token] = me.username
+                    changed = True
+                    logger.info("Добавлен новый бот id=%s (@%s)", bot_id, me.username)
+                elif old_row.token != bot_row.token:
+                    old_aiogram_bot = self._aiogram_bots.pop(bot_id)
+                    await old_aiogram_bot.session.close()
+                    self._bot_rows_by_token.pop(old_row.token, None)
+                    self._usernames_by_token.pop(old_row.token, None)
+
+                    aiogram_bot = AiogramBot(
+                        token=bot_row.token,
+                        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+                    )
+                    me = await aiogram_bot.get_me()
+                    self._aiogram_bots[bot_id] = aiogram_bot
+                    self._usernames_by_token[bot_row.token] = me.username
+                    changed = True
+
+                self._bot_rows[bot_id] = bot_row
                 self._bot_rows_by_token[bot_row.token] = bot_row
-                running.bot_row = bot_row
+
+            if changed:
+                await self._restart_polling()
 
     async def sync_loop(self) -> None:
         while not self._stopping:
@@ -154,7 +176,7 @@ class MultiBotManager:
             )
             await session.commit()
 
-        await self.stop_bot(bot_row.id)
+        await self.sync_once()  # немедленно применяем остановку, не дожидаясь следующего цикла
 
         try:
             master = self._get_master_bot()
@@ -173,16 +195,22 @@ class MultiBotManager:
     async def load_monitor_loop(self) -> None:
         while not self._stopping:
             await asyncio.sleep(60)
-            for bot_id, running in list(self._running.items()):
+            for bot_id, bot_row in list(self._bot_rows.items()):
                 count = load_last_10min(bot_id)
-                if count > running.bot_row.ddos_threshold_msgs_10min:
+                if count > bot_row.ddos_threshold_msgs_10min:
                     logger.warning("Bot id=%s превысил порог нагрузки: %s сообщений/10мин", bot_id, count)
-                    await self._auto_stop_bot(running.bot_row, count)
+                    await self._auto_stop_bot(bot_row, count)
 
     async def shutdown(self) -> None:
         self._stopping = True
-        for bot_id in list(self._running.keys()):
-            await self.stop_bot(bot_id)
+        if self._polling_task is not None:
+            self._polling_task.cancel()
+            try:
+                await self._polling_task
+            except asyncio.CancelledError:
+                pass
+        for aiogram_bot in self._aiogram_bots.values():
+            await aiogram_bot.session.close()
         if self._master_bot is not None:
             await self._master_bot.session.close()
 

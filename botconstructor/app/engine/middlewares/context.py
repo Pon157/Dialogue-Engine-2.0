@@ -1,6 +1,7 @@
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject
- 
+
+
 class BotContextMiddleware(BaseMiddleware):
     """Единый Dispatcher обслуживает все боты сразу (см. manager.py). Поэтому bot_row
     нельзя один раз положить в workflow_data при старте — вместо этого на каждый апдейт
@@ -11,10 +12,6 @@ class BotContextMiddleware(BaseMiddleware):
     def __init__(self, manager):
         self.manager = manager
 
- 
-    def __init__(self, manager):
-        self.manager = manager
- 
     async def __call__(self, handler, event: TelegramObject, data: dict):
         bot = data["bot"]
         bot_row = self.manager.get_bot_row(bot.token)
