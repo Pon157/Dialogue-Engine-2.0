@@ -112,6 +112,13 @@ PREMIUM_EMOJI = {
 }
 
 
+def btn_emoji(name: str, fallback: str = "•") -> str:
+    """Для ТЕКСТА КНОПОК. Telegram не рендерит HTML/<tg-emoji> внутри button.text —
+    там допустим только обычный текст, поэтому здесь всегда возвращаем обычный
+    юникод-эмодзи (fallback), никаких тегов. tg() — только для текста сообщений."""
+    return fallback
+
+
 def tg(name: str, fallback: str = "•") -> str:
     """Возвращает готовый <tg-emoji> тег для вставки в HTML-текст сообщения.
     Использование: f"{tg('fire')} Горячее предложение!"

@@ -5,7 +5,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from sqlalchemy import select
 
 from app.db import async_session
-from app.emoji import tg
+from app.emoji import btn_emoji, tg
 from app.master.states import CreateBot
 from app.models import Bot, BotType
 
@@ -15,9 +15,9 @@ router = Router(name="master_menu")
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=f"{tg('gear','⚙️')} Мои боты", callback_data="mybots")],
-            [InlineKeyboardButton(text=f"{tg('plus','➕')} Создать бота", callback_data="createbot")],
-            [InlineKeyboardButton(text=f"{tg('loudspeaker','📣')} Купить рекламу /ads", callback_data="ads_start")],
+            [InlineKeyboardButton(text=f"{btn_emoji('gear','⚙️')} Мои боты", callback_data="mybots")],
+            [InlineKeyboardButton(text=f"{btn_emoji('plus','➕')} Создать бота", callback_data="createbot")],
+            [InlineKeyboardButton(text=f"{btn_emoji('loudspeaker','📣')} Купить рекламу /ads", callback_data="ads_start")],
         ]
     )
 
@@ -49,7 +49,7 @@ async def my_bots(call: CallbackQuery):
             "У вас пока нет ботов.",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text=f"{tg('plus','➕')} Создать бота", callback_data="createbot")],
+                    [InlineKeyboardButton(text=f"{btn_emoji('plus','➕')} Создать бота", callback_data="createbot")],
                     [InlineKeyboardButton(text="⬅️ Назад", callback_data="mainmenu")],
                 ]
             ),
@@ -58,7 +58,7 @@ async def my_bots(call: CallbackQuery):
 
     rows = []
     for b in bots:
-        status = tg("green_circle", "🟢") if b.is_active else tg("red_circle", "🔴")
+        status = btn_emoji("green_circle", "🟢") if b.is_active else btn_emoji("red_circle", "🔴")
         rows.append([InlineKeyboardButton(text=f"{status} @{b.username or b.id}", callback_data=f"bot:{b.id}")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="mainmenu")])
     await call.message.edit_text("Ваши боты:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
@@ -104,8 +104,8 @@ async def create_bot_token(message: Message, state: FSMContext):
         f"Бот @{me.username} найден ✅\nВыберите тип бота:",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text=f"{tg('chat','💬')} Общение / поддержка", callback_data="type:support")],
-                [InlineKeyboardButton(text=f"{tg('loudspeaker','📣')} Постинг в канал", callback_data="type:posting")],
+                [InlineKeyboardButton(text=f"{btn_emoji('chat','💬')} Общение / поддержка", callback_data="type:support")],
+                [InlineKeyboardButton(text=f"{btn_emoji('loudspeaker','📣')} Постинг в канал", callback_data="type:posting")],
             ]
         ),
     )

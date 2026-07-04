@@ -3,7 +3,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from sqlalchemy import select, update
 
 from app.db import async_session
-from app.emoji import tg
+from app.emoji import btn_emoji, tg
 from app.engine.admin_check import is_bot_admin
 from app.models import Bot, BotType, PostingSettings, PostReview
 
@@ -23,8 +23,8 @@ def _review_kb(review_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text=f"{tg('check','✅')} Опубликовать", callback_data=f"postrev:{review_id}:approve", style="success"),
-                InlineKeyboardButton(text=f"{tg('cross','❌')} Отклонить", callback_data=f"postrev:{review_id}:reject", style="danger"),
+                InlineKeyboardButton(text=f"{btn_emoji('check','✅')} Опубликовать", callback_data=f"postrev:{review_id}:approve", style="success"),
+                InlineKeyboardButton(text=f"{btn_emoji('cross','❌')} Отклонить", callback_data=f"postrev:{review_id}:reject", style="danger"),
             ]
         ]
     )

@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, LabeledPrice, Message
 from sqlalchemy import select
 
 from app.db import async_session
@@ -103,7 +103,46 @@ async def cmd_start(message: Message, bot_row: Bot):
         await message.answer(welcome_text, parse_mode="HTML", reply_markup=markup)
 
 
-@router.callback_query(F.data.startswith("trg:"))
+@router.message(Command("donate"))
+async def cmd_donate(message: Message, bot_row: Bot):
+    if not bot_row.donate_enabled:
+        return
+    await message.answer("Введите количество звёзд ⭐, которое хотите задонатить (например: 50):")
+
+
+@router.message(F.text.regexp(r"^\d+$"))
+async def donate_amount(message: Message, bot_row: Bot):
+    """Ловит голое число ПОСЛЕ /donate. Проверяем через has_open_ticket как эвристику
+    не мешает — просто пробуем отправить invoice, если стоит донат и это похоже на сумму."""
+    if not bot_row.donate_enabled:
+        return
+    amount = int(message.text)
+    if not (1 <= amount <= 100000):
+        return
+    try:
+        await message.bot.send_invoice(
+            chat_id=message.chat.id,
+            title="Донат",
+            description=f"Поддержка проекта — {amount} ⭐",
+            payload=f"donate:{bot_row.id}:{message.from_user.id}",
+            currency="XTR",
+            prices=[LabeledPrice(label="Донат", amount=amount)],
+        )
+    except Exception:
+        pass
+
+
+@router.pre_checkout_query()
+async def pre_checkout(pre_checkout_query):
+    await pre_checkout_query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def successful_payment(message: Message, bot_row: Bot):
+    await message.answer(f"Спасибо за донат — {message.successful_payment.total_amount} ⭐! 💖")
+
+
+
 async def trigger_button(call: CallbackQuery, bot_row: Bot):
     key = call.data.split(":", 1)[1]
     async with async_session() as session:

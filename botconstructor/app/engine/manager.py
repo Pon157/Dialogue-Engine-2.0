@@ -14,31 +14,54 @@ from app.engine.handlers.base import router as base_router
 from app.engine.handlers.moderation import router as moderation_router
 from app.engine.handlers.posting import router as posting_router
 from app.engine.handlers.relay import router as relay_router
+from app.engine.handlers.settings_commands import router as settings_router
 from app.engine.middlewares.antispam import AntiSpamMiddleware, load_last_10min
+from app.engine.middlewares.context import BotContextMiddleware
 from app.models import Bot as BotRow
 
 logger = logging.getLogger("multibot")
 
 
 class RunningBot:
-    def __init__(self, bot_row: BotRow, aiogram_bot: AiogramBot, dp: Dispatcher, task: asyncio.Task):
+    def __init__(self, bot_row: BotRow, aiogram_bot: AiogramBot, task: asyncio.Task):
         self.bot_row = bot_row
         self.aiogram_bot = aiogram_bot
-        self.dp = dp
         self.task = task
         self.token = bot_row.token
 
 
 class MultiBotManager:
-    """Держит в памяти словарь {bot_id: RunningBot} и синхронизирует его с таблицей `bots`
-    в Postgres каждые BOT_POLL_INTERVAL секунд, а также следит за нагрузкой на каждого
-    бота (см. load_monitor_loop) — если бота начинают DDoS'ить, движок сам его
-    останавливает и шлёт уведомление владельцу через master-бота."""
+    """ВАЖНО: используется ОДИН общий Dispatcher и ОДИН набор роутеров на все боты сразу —
+    это единственно правильный способ в aiogram, т.к. Router можно прикрепить только
+    к одному Dispatcher (иначе 'Router is already attached'). Какой именно bot_row
+    относится к текущему апдейту, определяет BotContextMiddleware по bot.token.
+
+    Менеджер синхронизирует список запущенных aiogram Bot-инстансов с таблицей `bots`
+    в Postgres каждые BOT_POLL_INTERVAL секунд, следит за нагрузкой на каждого бота
+    (load_monitor_loop) и автоматически останавливает бота при похожей на DDoS нагрузке."""
 
     def __init__(self):
         self._running: dict[int, RunningBot] = {}
+        self._bot_rows_by_token: dict[str, BotRow] = {}
+        self._usernames_by_token: dict[str, str] = {}
         self._stopping = False
         self._master_bot: AiogramBot | None = None
+
+        self.dp = Dispatcher(storage=MemoryStorage())
+        self.dp.message.outer_middleware(AntiSpamMiddleware())
+        self.dp.callback_query.outer_middleware(AntiSpamMiddleware())
+        self.dp.update.outer_middleware(BotContextMiddleware(self))
+        self.dp.include_router(settings_router)
+        self.dp.include_router(moderation_router)
+        self.dp.include_router(relay_router)
+        self.dp.include_router(posting_router)
+        self.dp.include_router(base_router)
+
+    def get_bot_row(self, token: str) -> BotRow | None:
+        return self._bot_rows_by_token.get(token)
+
+    def get_username(self, token: str) -> str | None:
+        return self._usernames_by_token.get(token)
 
     def _get_master_bot(self) -> AiogramBot:
         if self._master_bot is None:
@@ -55,34 +78,28 @@ class MultiBotManager:
         )
         me = await aiogram_bot.get_me()
 
-        dp = Dispatcher(storage=MemoryStorage())
-        dp.message.outer_middleware(AntiSpamMiddleware())
-        dp.callback_query.outer_middleware(AntiSpamMiddleware())
-        dp.include_router(moderation_router)
-        dp.include_router(relay_router)
-        dp.include_router(posting_router)
-        dp.include_router(base_router)
-
-        dp["bot_row"] = bot_row
-        dp["bot_username"] = me.username
+        self._bot_rows_by_token[bot_row.token] = bot_row
+        self._usernames_by_token[bot_row.token] = me.username
 
         async def _poll():
             try:
                 await aiogram_bot.delete_webhook(drop_pending_updates=True)
-                await dp.start_polling(aiogram_bot, handle_signals=False)
+                await self.dp.start_polling(aiogram_bot, handle_signals=False)
             except asyncio.CancelledError:
                 pass
             except Exception:
                 logger.exception("Bot id=%s упал с ошибкой, будет перезапущен на след. цикле синка", bot_row.id)
 
         task = asyncio.create_task(_poll(), name=f"bot-{bot_row.id}")
-        self._running[bot_row.id] = RunningBot(bot_row, aiogram_bot, dp, task)
+        self._running[bot_row.id] = RunningBot(bot_row, aiogram_bot, task)
         logger.info("Запущен бот id=%s (@%s)", bot_row.id, me.username)
 
     async def stop_bot(self, bot_id: int) -> None:
         running = self._running.pop(bot_id, None)
         if running is None:
             return
+        self._bot_rows_by_token.pop(running.token, None)
+        self._usernames_by_token.pop(running.token, None)
         running.task.cancel()
         try:
             await running.task
@@ -111,7 +128,9 @@ class MultiBotManager:
             elif running.token != bot_row.token:
                 await self.reload_bot(bot_row)
             else:
-                running.dp["bot_row"] = bot_row
+                # настройки могли поменяться в БД — обновляем кэш, который читает
+                # BotContextMiddleware на каждый апдейт (без пересоздания бота)
+                self._bot_rows_by_token[bot_row.token] = bot_row
                 running.bot_row = bot_row
 
     async def sync_loop(self) -> None:
@@ -152,7 +171,6 @@ class MultiBotManager:
             logger.exception("Не удалось уведомить владельца bot_id=%s об автоостановке", bot_row.id)
 
     async def load_monitor_loop(self) -> None:
-        """Раз в минуту проверяет нагрузку за последние 10 минут по каждому запущенному боту."""
         while not self._stopping:
             await asyncio.sleep(60)
             for bot_id, running in list(self._running.items()):

@@ -9,7 +9,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton
 from sqlalchemy import select
 
 from app.db import async_session
-from app.emoji import tg
+from app.emoji import btn_emoji, tg
 from app.master.states import Broadcast as BroadcastState
 from app.models import Bot, BotUser, Broadcast, MessageLog
 
@@ -49,8 +49,8 @@ async def broadcast_content(message: Message, state: FSMContext):
         "Кому отправить?",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text=f"{tg('house','👥')} Всем пользователям", callback_data="bcast:all")],
-                [InlineKeyboardButton(text=f"{tg('fire','🔥')} Только активным", callback_data="bcast:active")],
+                [InlineKeyboardButton(text=f"{btn_emoji('house','👥')} Всем пользователям", callback_data="bcast:all")],
+                [InlineKeyboardButton(text=f"{btn_emoji('fire','🔥')} Только активным", callback_data="bcast:active")],
             ]
         ),
     )

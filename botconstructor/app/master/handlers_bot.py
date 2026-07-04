@@ -4,9 +4,9 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from sqlalchemy import select, update
 
 from app.db import async_session
-from app.emoji import tg
+from app.emoji import btn_emoji, tg
 from app.master.states import AddButton, EditAntispam, EditWelcome
-from app.models import Bot, ButtonKind, ButtonStyle, InlineButton
+from app.models import Bot, ButtonKind, ButtonStyle, ForwardMode, InlineButton
 
 router = Router(name="master_bot")
 
@@ -20,18 +20,20 @@ async def _get_bot(bot_id: int, owner_tg_id: int) -> Bot | None:
 
 
 def bot_menu_kb(b: Bot) -> InlineKeyboardMarkup:
-    toggle_text = f"{tg('red_circle','🔴')} Выключить" if b.is_active else f"{tg('green_circle','🟢')} Включить"
-    antispam_text = f"{tg('shield','🛡')} Антиспам: {'вкл' if b.antispam_enabled else 'выкл'}"
-    captcha_text = f"{tg('lock','🔒')} Капча: {'вкл' if b.captcha_enabled else 'выкл'}"
+    toggle_text = f"{btn_emoji('red_circle','🔴')} Выключить" if b.is_active else f"{btn_emoji('green_circle','🟢')} Включить"
+    antispam_text = f"{btn_emoji('shield','🛡')} Антиспам: {'вкл' if b.antispam_enabled else 'выкл'}"
+    captcha_text = f"{btn_emoji('lock','🔒')} Капча: {'вкл' if b.captcha_enabled else 'выкл'}"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=toggle_text, callback_data=f"bot:{b.id}:toggle")],
-            [InlineKeyboardButton(text=f"{tg('pencil','✏️')} Приветственный текст", callback_data=f"bot:{b.id}:welcome")],
+            [InlineKeyboardButton(text=f"{btn_emoji('pencil','✏️')} Приветственный текст", callback_data=f"bot:{b.id}:welcome")],
             [InlineKeyboardButton(text=antispam_text, callback_data=f"bot:{b.id}:antispam")],
             [InlineKeyboardButton(text=captcha_text, callback_data=f"bot:{b.id}:captcha")],
-            [InlineKeyboardButton(text=f"{tg('plus','➕')} Добавить inline-кнопку", callback_data=f"bot:{b.id}:addbtn")],
-            [InlineKeyboardButton(text=f"{tg('loudspeaker','📣')} Рассылка", callback_data=f"bot:{b.id}:broadcast")],
-            [InlineKeyboardButton(text=f"{tg('chart','📊')} Статистика", callback_data=f"bot:{b.id}:stats")],
+            [InlineKeyboardButton(text=f"{btn_emoji('plus','➕')} Добавить inline-кнопку", callback_data=f"bot:{b.id}:addbtn")],
+            [InlineKeyboardButton(text=f"{btn_emoji('loudspeaker','📣')} Рассылка", callback_data=f"bot:{b.id}:broadcast")],
+            [InlineKeyboardButton(text=f"{btn_emoji('chart','📊')} Статистика", callback_data=f"bot:{b.id}:stats")],
+            [InlineKeyboardButton(text=f"{btn_emoji('link','🔗')} Пересылка/копирование", callback_data=f"bot:{b.id}:forward")],
+            [InlineKeyboardButton(text=f"{btn_emoji('dollar','💵')} Донат", callback_data=f"bot:{b.id}:donate")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="mybots")],
         ]
     )
@@ -46,7 +48,121 @@ async def bot_menu(call: CallbackQuery):
         return
     status = "работает" if b.is_active else "остановлен"
     extra = f"\n\n{tg('warning','⚠️')} {b.auto_stopped_reason}" if b.auto_stopped_reason else ""
-    await call.message.edit_text(f"Бот @{b.username} — {status}{extra}", reply_markup=bot_menu_kb(b))
+    hint = (
+        f"\n\n<i>Чтобы назначить чат обращений — отправьте /setchat в нужной группе.\n"
+        f"Чтобы назначить канал для постинга — перешлите любой пост из канала боту в личку.\n"
+        f"Чтобы назначить группу модерации — отправьте /setreviewchat в этой группе.</i>"
+    )
+    await call.message.edit_text(f"Бот @{b.username} — {status}{extra}{hint}", reply_markup=bot_menu_kb(b), parse_mode="HTML")
+
+
+def forward_kb(b: Bot) -> InlineKeyboardMarkup:
+    mode_label = "Пересылка (forward)" if b.forward_mode.value == "forward" else "Копирование (copy)"
+    rows = [
+        [InlineKeyboardButton(text=f"Режим: {mode_label} (нажмите, чтобы сменить)", callback_data=f"bot:{b.id}:forward:toggle_mode")],
+    ]
+    if b.forward_mode.value == "copy":
+        rows += [
+            [InlineKeyboardButton(text=f"Показывать имя: {'да' if b.copy_show_name else 'нет'}", callback_data=f"bot:{b.id}:forward:toggle_name")],
+            [InlineKeyboardButton(text=f"Показывать @username: {'да' if b.copy_show_username else 'нет'}", callback_data=f"bot:{b.id}:forward:toggle_username")],
+            [InlineKeyboardButton(text=f"Показывать ID: {'да' if b.copy_show_id else 'нет'}", callback_data=f"bot:{b.id}:forward:toggle_id")],
+        ]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"bot:{b.id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.regexp(r"^bot:(\d+):forward$"))
+async def forward_menu(call: CallbackQuery):
+    bot_id = int(call.data.split(":")[1])
+    b = await _get_bot(bot_id, call.from_user.id)
+    if not b:
+        return
+    await call.message.edit_text(
+        "Настройки пересылки обращений в чат обращений.\n"
+        "«Пересылка» сохраняет исходное сообщение как forward (виден автор для Telegram, "
+        "но не редактируется). «Копирование» шлёт копию с настраиваемой шапкой.",
+        reply_markup=forward_kb(b),
+    )
+
+
+@router.callback_query(F.data.regexp(r"^bot:(\d+):forward:toggle_(mode|name|username|id)$"))
+async def forward_toggle(call: CallbackQuery):
+    bot_id = int(call.data.split(":")[1])
+    field = call.data.split(":")[-1]
+    b = await _get_bot(bot_id, call.from_user.id)
+    if not b:
+        return
+
+    async with async_session() as session:
+        if field == "mode":
+            new_mode = ForwardMode.COPY if b.forward_mode == ForwardMode.FORWARD else ForwardMode.FORWARD
+            await session.execute(update(Bot).where(Bot.id == bot_id).values(forward_mode=new_mode))
+            b.forward_mode = new_mode
+        else:
+            col = {"name": "copy_show_name", "username": "copy_show_username", "id": "copy_show_id"}[field]
+            new_val = not getattr(b, col)
+            await session.execute(update(Bot).where(Bot.id == bot_id).values(**{col: new_val}))
+            setattr(b, col, new_val)
+        await session.commit()
+
+    await call.message.edit_text("Настройки пересылки обновлены:", reply_markup=forward_kb(b))
+
+
+def donate_kb(b: Bot) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"Донат: {'ВКЛ' if b.donate_enabled else 'ВЫКЛ'} (нажмите, чтобы переключить)",
+                callback_data=f"bot:{b.id}:donate:toggle",
+            )],
+            [InlineKeyboardButton(
+                text=f"Тип кнопки: {b.donate_button_kind or 'inline'} (нажмите, чтобы сменить)",
+                callback_data=f"bot:{b.id}:donate:kind",
+            )],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"bot:{b.id}")],
+        ]
+    )
+
+
+@router.callback_query(F.data.regexp(r"^bot:(\d+):donate$"))
+async def donate_menu(call: CallbackQuery):
+    bot_id = int(call.data.split(":")[1])
+    b = await _get_bot(bot_id, call.from_user.id)
+    if not b:
+        return
+    await call.message.edit_text(
+        f"{tg('dollar','💵')} Донат через Telegram Stars: пользователь сам вводит "
+        "количество звёзд, бот присылает счёт (invoice) на оплату.",
+        reply_markup=donate_kb(b),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.regexp(r"^bot:(\d+):donate:toggle$"))
+async def donate_toggle(call: CallbackQuery):
+    bot_id = int(call.data.split(":")[1])
+    b = await _get_bot(bot_id, call.from_user.id)
+    if not b:
+        return
+    async with async_session() as session:
+        await session.execute(update(Bot).where(Bot.id == bot_id).values(donate_enabled=not b.donate_enabled))
+        await session.commit()
+    b.donate_enabled = not b.donate_enabled
+    await call.message.edit_text("Настройки доната обновлены:", reply_markup=donate_kb(b))
+
+
+@router.callback_query(F.data.regexp(r"^bot:(\d+):donate:kind$"))
+async def donate_kind_toggle(call: CallbackQuery):
+    bot_id = int(call.data.split(":")[1])
+    b = await _get_bot(bot_id, call.from_user.id)
+    if not b:
+        return
+    new_kind = "keyboard" if (b.donate_button_kind or "inline") == "inline" else "inline"
+    async with async_session() as session:
+        await session.execute(update(Bot).where(Bot.id == bot_id).values(donate_button_kind=new_kind))
+        await session.commit()
+    b.donate_button_kind = new_kind
+    await call.message.edit_text("Настройки доната обновлены:", reply_markup=donate_kb(b))
 
 
 @router.callback_query(F.data.regexp(r"^bot:(\d+):toggle$"))
