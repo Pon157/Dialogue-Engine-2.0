@@ -13,6 +13,7 @@ from app.db import async_session
 from app.engine.handlers.base import router as base_router
 from app.engine.handlers.moderation import router as moderation_router
 from app.engine.handlers.posting import router as posting_router
+from app.engine.handlers.relay import router as relay_router
 from app.engine.middlewares.antispam import AntiSpamMiddleware, load_last_10min
 from app.models import Bot as BotRow
 
@@ -58,6 +59,7 @@ class MultiBotManager:
         dp.message.outer_middleware(AntiSpamMiddleware())
         dp.callback_query.outer_middleware(AntiSpamMiddleware())
         dp.include_router(moderation_router)
+        dp.include_router(relay_router)
         dp.include_router(posting_router)
         dp.include_router(base_router)
 

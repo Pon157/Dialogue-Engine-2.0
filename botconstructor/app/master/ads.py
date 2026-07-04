@@ -1,8 +1,11 @@
+from datetime import datetime, timedelta, timezone
+
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from app.config import settings
 from app.db import async_session
 from app.emoji import tg
 from app.master.states import BuyAd
@@ -20,7 +23,44 @@ def _tariffs_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-@router.message(Command("ads"))
+@router.message(Command("approve_ad"))
+async def approve_ad(message: Message):
+    if message.from_user.id not in settings.platform_admin_ids:
+        return
+    if not message.text or " " not in message.text or not message.text.split()[1].isdigit():
+        await message.answer("Формат: <code>/approve_ad ID</code>")
+        return
+    order_id = int(message.text.split()[1])
+
+    async with async_session() as session:
+        result = await session.execute(select(AdOrder).where(AdOrder.id == order_id))
+        order = result.scalar_one_or_none()
+        if order is None:
+            await message.answer("Заявка не найдена.")
+            return
+        if order.status != AdStatus.PENDING_PAYMENT:
+            await message.answer(f"Заявка уже в статусе {order.status.value}.")
+            return
+
+        now = datetime.now(timezone.utc)
+        order.status = AdStatus.ACTIVE
+        order.starts_at = now
+        order.expires_at = now + timedelta(hours=order.duration_hours)
+        await session.commit()
+
+    await message.answer(f"Реклама №{order_id} активирована до {order.expires_at:%d.%m.%Y %H:%M} UTC ✅")
+
+    try:
+        from aiogram import Bot as AiogramBot
+
+        notify = AiogramBot(token=settings.MASTER_BOT_TOKEN)
+        await notify.send_message(order.buyer_tg_id, f"{tg('check','✅')} Ваша реклама №{order_id} оплачена и активирована!")
+        await notify.session.close()
+    except Exception:
+        pass
+
+
+
 @router.callback_query(F.data == "ads_start")
 async def ads_start(event: Message | CallbackQuery, state: FSMContext):
     await state.set_state(BuyAd.waiting_text)

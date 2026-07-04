@@ -11,7 +11,7 @@ router = Router(name="posting")
 router.message.filter(F.chat.type == "private")
 
 
-async def _only_posting_bots(bot_row: Bot) -> bool:
+async def _only_posting_bots(event, bot_row: Bot) -> bool:
     return bot_row.bot_type == BotType.POSTING
 
 
